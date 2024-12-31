@@ -112,8 +112,6 @@ struct RawGemmArguments {
   int threadblock_count{};
 };
 
-typedef std::shared_ptr<RawGemmArguments> RawGemmArgumentsPtr;
-
 template <
   typename Gemm,
   typename ElementA, typename ElementB, typename ElementC
@@ -137,6 +135,33 @@ RawGemmArguments MakeArgumentsOnDevice(int num_experts, const torch::Device& dev
       // We don't know the problem dimensions on the host, so we just base the number of threadblocks on occupancy here.
       .threadblock_count = Gemm::sufficient(),
     };
+}
+
+template <
+  typename Gemm,
+  typename ElementA, typename ElementB, typename ElementC
+>
+RawGemmArgumentsPtr MakeArgumentsPtrOnDevice(int num_experts, const torch::Device& device) {
+    TORCH_CHECK(
+        num_experts <= kMaxExperts,
+        "At most ", kMaxExperts,
+        " experts are supported when batch_sizes is a CUDA tensor, but got ", num_experts
+    );
+
+    return std::make_shared<RawGemmArguments>(
+      RawGemmArguments {
+        .lda = TypedEmpty<int64_t>(num_experts, device),
+        .ldb = TypedEmpty<int64_t>(num_experts, device),
+        .ldc = TypedEmpty<int64_t>(num_experts, device),
+        .ptr_a = TypedEmpty<ElementA*>(num_experts, device),
+        .ptr_b = TypedEmpty<ElementB*>(num_experts, device),
+        .ptr_c = TypedEmpty<ElementC*>(num_experts, device),
+        .problem_sizes = TypedEmpty<cutlass::gemm::GemmCoord>(num_experts, device),
+
+        // We don't know the problem dimensions on the host, so we just base the number of threadblocks on occupancy here.
+        .threadblock_count = Gemm::sufficient(),
+      }
+    );
 }
 
 template <
@@ -223,6 +248,31 @@ RawGemmArguments MakeArgumentsOnHost(torch::Tensor a,
   };
 }
 
+template<typename Gemm, typename ElementA, typename ElementB, typename ElementC>
+typename Gemm::Arguments WrapArguments(
+  int64_t num_experts,
+  RawGemmArguments &raw_args) {
+  typename Gemm::EpilogueOutputOp::Params epilogue_op(/*alpha=*/1.0f, /*beta=*/0.0f);
+  // We currently always use `GroupScheduleMode::kDeviceOnly`, which doesn't use `host_problem_sizes` at all,
+  // so we can safely pass `nullptr` for `host_problem_sizes`.
+  // TODO(tgale): Experiment with `GroupScheduleMode::kHostPrecompute` for `batch_sizes.is_cpu()`, where we
+  // know the problem dimensions on the host.
+  typename Gemm::Arguments arguments((cutlass::gemm::GemmCoord*)raw_args.problem_sizes.data_ptr(),
+				     (int)num_experts,
+				     (int)raw_args.threadblock_count,
+				     epilogue_op,
+				     (ElementA**)raw_args.ptr_a.data_ptr(),
+				     (ElementB**)raw_args.ptr_b.data_ptr(),
+				     (ElementC**)raw_args.ptr_c.data_ptr(),
+				     (ElementC**)raw_args.ptr_c.data_ptr(),
+				     /*lda=*/(int64_t*)raw_args.lda.data_ptr(),
+				     /*ldb=*/(int64_t*)raw_args.ldb.data_ptr(),
+				     /*ldc=*/(int64_t*)raw_args.ldc.data_ptr(),
+				     /*ldd=*/(int64_t*)raw_args.ldc.data_ptr(),
+				     /*host_problem_sizes=*/nullptr);
+  return arguments;
+}
+
 template <
   bool kDynamicK,
   typename Gemm,
@@ -234,19 +284,24 @@ typename Gemm::Arguments MakeArguments(torch::Tensor a,
 				       torch::Tensor c,
 				       torch::Tensor batch_sizes,
 				       ::cutlass::gemm::GemmCoord coord_template,
-				       int64_t num_experts) {
+				       int64_t num_experts,
+               RawGemmArguments* raw_args_ptr=nullptr) {
   RawGemmArguments raw_args;
-  if (batch_sizes.is_cuda()) {
-    raw_args = MakeArgumentsOnDevice<
-      Gemm, ElementA, ElementB, ElementC
-    >(num_experts, a.device());
+  if (raw_args_ptr) {
+    raw_args = *raw_args_ptr;
   } else {
-    raw_args = MakeArgumentsOnHost<
-      kDynamicK,
-      Gemm,
-      ElementA, ElementB, ElementC,
-      LayoutA, LayoutB, LayoutC
-    >(a, b, c, batch_sizes, coord_template, num_experts);
+    if (batch_sizes.is_cuda()) {
+      raw_args = MakeArgumentsOnDevice<
+        Gemm, ElementA, ElementB, ElementC
+      >(num_experts, a.device());
+    } else {
+      raw_args = MakeArgumentsOnHost<
+        kDynamicK,
+        Gemm,
+        ElementA, ElementB, ElementC,
+        LayoutA, LayoutB, LayoutC
+      >(a, b, c, batch_sizes, coord_template, num_experts);
+    }
   }
 
   // Validate the result.
@@ -331,7 +386,7 @@ torch::Tensor CutlassGroupedGemmWithArguments(torch::Tensor a,
 				 torch::Tensor batch_sizes,
 				 ::cutlass::gemm::GemmCoord coord_template,
          torch::Tensor workspace,
-         RawGemmArguments &arguments) {
+         RawGemmArguments &arguments_raw) {
   using Gemm = GemmGrouped<trans_a, trans_b>;
   using LayoutA = typename Gemm::LayoutA;
   using LayoutB = typename Gemm::LayoutB;
@@ -343,12 +398,12 @@ torch::Tensor CutlassGroupedGemmWithArguments(torch::Tensor a,
 
   Gemm gemm;
   int64_t num_experts = batch_sizes.size(0);
-  // auto arguments = MakeArguments<
-  //   /*kDynamicK*/trans_a,
-  //   Gemm,
-  //   ElementA, ElementB, ElementC,
-  //   LayoutA, LayoutB, LayoutC
-  // >(a, b, c, batch_sizes, coord_template, num_experts);
+  auto arguments = MakeArguments<
+    /*kDynamicK*/trans_a,
+    Gemm,
+    ElementA, ElementB, ElementC,
+    LayoutA, LayoutB, LayoutC
+  >(a, b, c, batch_sizes, coord_template, num_experts, &arguments_raw);
   // int64_t workspace_size = gemm.get_workspace_size(arguments);
   // auto options = torch::TensorOptions().dtype(torch::kInt8).device(a.device());
   // torch::Tensor workspace = torch::empty(workspace_size, options);
@@ -518,29 +573,32 @@ void GroupedGemmVariableK(torch::Tensor a,
 }
 
 template<bool trans_a, bool trans_b>
-std::pair<int64_t, RawGemmArguments> GetCutlassArgumentsInternal(int num_experts, const torch::Device) {
+std::pair<int64_t, RawGemmArgumentsPtr> GetCutlassArgumentsInternal(
+  int num_experts, const torch::Device& device) {
   using Gemm = GemmGrouped<trans_a, trans_b>;
   using ElementA = typename Gemm::ElementA;
   using ElementB = typename Gemm::ElementB;
   using ElementC = typename Gemm::ElementC;
 
-  auto arguments = MakeArgumentsOnDevice<Gemm, ElementA, ElementB, ElementC>(num_experts, device);
+  Gemm gemm;
+  auto args_raw = MakeArgumentsPtrOnDevice<Gemm, ElementA, ElementB, ElementC>(num_experts, device);
+  auto arguments = WrapArguments<Gemm, ElementA, ElementB, ElementC>(num_experts, *args_raw);
   int64_t workspace_size = gemm.get_workspace_size(arguments);
 
-  return std::make_pair(workspace_size, std::make_shared(arguments));
+  return std::make_pair(workspace_size, args_raw);
 }
 
-std::pair<int64_t, RawGemmArguments> GetCutlassArguments(
+std::pair<int64_t, RawGemmArgumentsPtr> GetCutlassArguments(
 	int num_experts, const torch::Device& device,
 	bool trans_a, bool trans_b) {
-  if (trans_a) {
-    return GetCutlassArgumentsInternal<true, false>(num_experts, device);
-  else if (trans_b)
-    return GetCutlassArgumentsInternal<false, true>(num_experts, device);
+  // if (trans_a)
+  //   return GetCutlassArgumentsInternal<true, false>(num_experts, device);
+  // else if (trans_b)
+  //   return GetCutlassArgumentsInternal<false, true>(num_experts, device);
   return GetCutlassArgumentsInternal<false, false>(num_experts, device);
 }
 
-void InputCheck(torch::Tensor a,
+std::pair<size_t, size_t> InputCheck(torch::Tensor a,
 		 torch::Tensor b,
 		 torch::Tensor c,
 		 torch::Tensor batch_sizes,
@@ -611,6 +669,8 @@ void InputCheck(torch::Tensor a,
   TORCH_CHECK(a.is_contiguous());
   TORCH_CHECK(b.is_contiguous());
   TORCH_CHECK(c.is_contiguous());
+
+  return std::make_pair(hidden_in, hidden_out);
 }
 
 void GroupedGemmWithArgumnts(torch::Tensor a,
@@ -620,18 +680,19 @@ void GroupedGemmWithArgumnts(torch::Tensor a,
             bool trans_a, bool trans_b,
             torch::Tensor workspace,
             RawGemmArgumentsPtr arguments) {
-  InputCheck(a, b, c, batch_sizes, trans_a, trans_b);
+  std::pair<size_t, size_t> sizes = InputCheck(a, b, c, batch_sizes, trans_a, trans_b);
+  auto hidden_in = sizes.first, hidden_out = sizes.second;
   const auto coord_template = trans_a
     ? cutlass::gemm::GemmCoord(hidden_in, hidden_out, kDynamicDim)
     : cutlass::gemm::GemmCoord(kDynamicDim, hidden_out, hidden_in);
-  if (trans_a) {
-    CutlassGroupedGemmWithArguments<true, false>(a, b, c, batch_sizes, coord_template, workspace, *arguments);
-    return;
-  }
-  if (trans_b) {
-    CutlassGroupedGemmWithArguments<false, true>(a, b, c, batch_sizes, coord_template, workspace, *arguments);
-    return;
-  }
+  // if (trans_a) {
+  //   CutlassGroupedGemmWithArguments<true, false>(a, b, c, batch_sizes, coord_template, workspace, *arguments);
+  //   return;
+  // }
+  // if (trans_b) {
+  //   CutlassGroupedGemmWithArguments<false, true>(a, b, c, batch_sizes, coord_template, workspace, *arguments);
+  //   return;
+  // }
   CutlassGroupedGemmWithArguments<false, false>(a, b, c, batch_sizes, coord_template, workspace, *arguments);
 }
 
@@ -644,7 +705,8 @@ void GroupedGemm(torch::Tensor a,
 		 torch::Tensor c,
 		 torch::Tensor batch_sizes,
 		 bool trans_a, bool trans_b) {
-  InputCheck(a, b, c, batch_sizes, trans_a, trans_b);
+  std::pair<size_t, size_t> sizes = InputCheck(a, b, c, batch_sizes, trans_a, trans_b);
+  auto hidden_in = sizes.first, hidden_out = sizes.second;
 
 #if !defined(GROUPED_GEMM_CUTLASS)
   CublasGroupedGemm(a, b, c, batch_sizes, trans_b);

@@ -27,3 +27,8 @@ def gmm(a, b, batch_sizes, trans_a=False, trans_b=False, c=None):
     backend.gmm(a, b, c, batch_sizes, trans_a, trans_b)
     return c
 
+def gmm_with_arguments(a, b, batch_sizes, workspace, arguments, trans_a=False, trans_b=False, c=None):
+    if c is None:
+        c = _allocate_output(a, b, batch_sizes, trans_a, trans_b)
+    backend.gmm_with_arguments(a, b, c, batch_sizes, trans_a, trans_b, workspace, arguments)
+    return c
