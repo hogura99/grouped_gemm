@@ -112,6 +112,8 @@ struct RawGemmArguments {
   int threadblock_count{};
 };
 
+typedef std::shared_ptr<RawGemmArguments> RawGemmArgumentsPtr;
+
 template <
   typename Gemm,
   typename ElementA, typename ElementB, typename ElementC
@@ -321,6 +323,58 @@ void RemoveK0Problems(int num_experts, const Args& arguments) {
   );
 }
 
+
+template <bool trans_a, bool trans_b>
+torch::Tensor CutlassGroupedGemmWithArguments(torch::Tensor a,
+				 torch::Tensor b,
+				 torch::Tensor c,
+				 torch::Tensor batch_sizes,
+				 ::cutlass::gemm::GemmCoord coord_template,
+         torch::Tensor workspace,
+         RawGemmArguments &arguments) {
+  using Gemm = GemmGrouped<trans_a, trans_b>;
+  using LayoutA = typename Gemm::LayoutA;
+  using LayoutB = typename Gemm::LayoutB;
+  using LayoutC = typename Gemm::LayoutC;
+
+  using ElementA = typename Gemm::ElementA;
+  using ElementB = typename Gemm::ElementB;
+  using ElementC = typename Gemm::ElementC;
+
+  Gemm gemm;
+  int64_t num_experts = batch_sizes.size(0);
+  // auto arguments = MakeArguments<
+  //   /*kDynamicK*/trans_a,
+  //   Gemm,
+  //   ElementA, ElementB, ElementC,
+  //   LayoutA, LayoutB, LayoutC
+  // >(a, b, c, batch_sizes, coord_template, num_experts);
+  // int64_t workspace_size = gemm.get_workspace_size(arguments);
+  // auto options = torch::TensorOptions().dtype(torch::kInt8).device(a.device());
+  // torch::Tensor workspace = torch::empty(workspace_size, options);
+
+  if (batch_sizes.is_cuda()) {
+      FillCutlassArguments<
+        trans_a,
+        ElementA, ElementB, ElementC,
+        LayoutA, LayoutB, LayoutC
+      >(num_experts, batch_sizes, a, b, c, arguments, coord_template);
+
+      RemoveK0Problems<>(num_experts, arguments);
+  }
+
+  // Initialize the kernel.
+  if(gemm.initialize(arguments, workspace.data_ptr()) != cutlass::Status::kSuccess) {
+    TORCH_CHECK(false, "Failed to initialize CUTLASS Grouped GEMM");
+  }
+
+  // Execute the kernel in the current stream.
+  if(gemm.run(c10::cuda::getCurrentCUDAStream()) != cutlass::Status::kSuccess) {
+    TORCH_CHECK(false, "Failed to run CUTLASS Grouped GEMM");
+  }
+  return c;
+}
+
 template <bool trans_a, bool trans_b>
 torch::Tensor CutlassGroupedGemm(torch::Tensor a,
 				 torch::Tensor b,
@@ -463,11 +517,30 @@ void GroupedGemmVariableK(torch::Tensor a,
   CublasGroupedGemmVariableK(a, b, c, batch_sizes);
 }
 
-// NOTE: We only support dynamic group sizes for the 'a' tensor. Tensor 'b' is
-// assumed to be batched with fixed sized batches.
-//
-// TODO(tgale): Validate alignment is true for every batch element.
-void GroupedGemm(torch::Tensor a,
+template<bool trans_a, bool trans_b>
+std::pair<int64_t, RawGemmArguments> GetCutlassArgumentsInternal(int num_experts, const torch::Device) {
+  using Gemm = GemmGrouped<trans_a, trans_b>;
+  using ElementA = typename Gemm::ElementA;
+  using ElementB = typename Gemm::ElementB;
+  using ElementC = typename Gemm::ElementC;
+
+  auto arguments = MakeArgumentsOnDevice<Gemm, ElementA, ElementB, ElementC>(num_experts, device);
+  int64_t workspace_size = gemm.get_workspace_size(arguments);
+
+  return std::make_pair(workspace_size, std::make_shared(arguments));
+}
+
+std::pair<int64_t, RawGemmArguments> GetCutlassArguments(
+	int num_experts, const torch::Device& device,
+	bool trans_a, bool trans_b) {
+  if (trans_a) {
+    return GetCutlassArgumentsInternal<true, false>(num_experts, device);
+  else if (trans_b)
+    return GetCutlassArgumentsInternal<false, true>(num_experts, device);
+  return GetCutlassArgumentsInternal<false, false>(num_experts, device);
+}
+
+void InputCheck(torch::Tensor a,
 		 torch::Tensor b,
 		 torch::Tensor c,
 		 torch::Tensor batch_sizes,
@@ -538,6 +611,40 @@ void GroupedGemm(torch::Tensor a,
   TORCH_CHECK(a.is_contiguous());
   TORCH_CHECK(b.is_contiguous());
   TORCH_CHECK(c.is_contiguous());
+}
+
+void GroupedGemmWithArgumnts(torch::Tensor a,
+            torch::Tensor b,
+            torch::Tensor c,
+            torch::Tensor batch_sizes,
+            bool trans_a, bool trans_b,
+            torch::Tensor workspace,
+            RawGemmArgumentsPtr arguments) {
+  InputCheck(a, b, c, batch_sizes, trans_a, trans_b);
+  const auto coord_template = trans_a
+    ? cutlass::gemm::GemmCoord(hidden_in, hidden_out, kDynamicDim)
+    : cutlass::gemm::GemmCoord(kDynamicDim, hidden_out, hidden_in);
+  if (trans_a) {
+    CutlassGroupedGemmWithArguments<true, false>(a, b, c, batch_sizes, coord_template, workspace, *arguments);
+    return;
+  }
+  if (trans_b) {
+    CutlassGroupedGemmWithArguments<false, true>(a, b, c, batch_sizes, coord_template, workspace, *arguments);
+    return;
+  }
+  CutlassGroupedGemmWithArguments<false, false>(a, b, c, batch_sizes, coord_template, workspace, *arguments);
+}
+
+// NOTE: We only support dynamic group sizes for the 'a' tensor. Tensor 'b' is
+// assumed to be batched with fixed sized batches.
+//
+// TODO(tgale): Validate alignment is true for every batch element.
+void GroupedGemm(torch::Tensor a,
+		 torch::Tensor b,
+		 torch::Tensor c,
+		 torch::Tensor batch_sizes,
+		 bool trans_a, bool trans_b) {
+  InputCheck(a, b, c, batch_sizes, trans_a, trans_b);
 
 #if !defined(GROUPED_GEMM_CUTLASS)
   CublasGroupedGemm(a, b, c, batch_sizes, trans_b);
