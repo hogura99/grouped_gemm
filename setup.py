@@ -19,7 +19,7 @@ else:
 cwd = Path(os.path.dirname(os.path.abspath(__file__)))
 
 nvcc_flags = [
-    "-std=c++17",  # NOTE: CUTLASS requires c++17
+    "-std=c++17", "-w",  # NOTE: CUTLASS requires c++17
 ]
 
 if device_capability:
@@ -40,7 +40,7 @@ ext_modules = [
         ],
         extra_compile_args={
             "cxx": [
-                "-fopenmp", "-fPIC", "-Wno-strict-aliasing"
+                "-fopenmp", "-fPIC", "-Wno-strict-aliasing", "-w"
             ],
             "nvcc": nvcc_flags,
         }
