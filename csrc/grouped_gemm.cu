@@ -15,6 +15,7 @@
 #include "cutlass/gemm/device/gemm_grouped.h"
 
 #include <type_traits>
+#include <cstdio>
 
 namespace grouped_gemm {
 
@@ -148,8 +149,7 @@ RawGemmArgumentsPtr MakeArgumentsPtrOnDevice(int num_experts, const torch::Devic
         " experts are supported when batch_sizes is a CUDA tensor, but got ", num_experts
     );
 
-    return std::make_shared<RawGemmArguments>(
-      RawGemmArguments {
+    return (uintptr_t) new RawGemmArguments {
         .lda = TypedEmpty<int64_t>(num_experts, device),
         .ldb = TypedEmpty<int64_t>(num_experts, device),
         .ldc = TypedEmpty<int64_t>(num_experts, device),
@@ -160,8 +160,7 @@ RawGemmArgumentsPtr MakeArgumentsPtrOnDevice(int num_experts, const torch::Devic
 
         // We don't know the problem dimensions on the host, so we just base the number of threadblocks on occupancy here.
         .threadblock_count = Gemm::sufficient(),
-      }
-    );
+      };
 }
 
 template <
@@ -457,6 +456,8 @@ torch::Tensor CutlassGroupedGemm(torch::Tensor a,
   auto options = torch::TensorOptions().dtype(torch::kInt8).device(a.device());
   torch::Tensor workspace = torch::empty(workspace_size, options);
 
+  printf("workspace size: %u, ElementA size: %u, ElementB size: %u, ElementC size: %u\n", workspace_size, sizeof(ElementA), sizeof(ElementB), sizeof(ElementC));
+
   if (batch_sizes.is_cuda()) {
       FillCutlassArguments<
         trans_a,
@@ -582,7 +583,8 @@ std::pair<int64_t, RawGemmArgumentsPtr> GetCutlassArgumentsInternal(
 
   Gemm gemm;
   auto args_raw = MakeArgumentsPtrOnDevice<Gemm, ElementA, ElementB, ElementC>(num_experts, device);
-  auto arguments = WrapArguments<Gemm, ElementA, ElementB, ElementC>(num_experts, *args_raw);
+  RawGemmArguments* args = (RawGemmArguments*) args_raw;
+  auto arguments = WrapArguments<Gemm, ElementA, ElementB, ElementC>(num_experts, *args);
   int64_t workspace_size = gemm.get_workspace_size(arguments);
 
   return std::make_pair(workspace_size, args_raw);
@@ -679,12 +681,13 @@ void GroupedGemmWithArgumnts(torch::Tensor a,
             torch::Tensor batch_sizes,
             bool trans_a, bool trans_b,
             torch::Tensor workspace,
-            RawGemmArgumentsPtr arguments) {
+            RawGemmArgumentsPtr args_ptr) {
   std::pair<size_t, size_t> sizes = InputCheck(a, b, c, batch_sizes, trans_a, trans_b);
   auto hidden_in = sizes.first, hidden_out = sizes.second;
   const auto coord_template = trans_a
     ? cutlass::gemm::GemmCoord(hidden_in, hidden_out, kDynamicDim)
     : cutlass::gemm::GemmCoord(kDynamicDim, hidden_out, hidden_in);
+  RawGemmArguments* arguments = (RawGemmArguments*) args_ptr;
   // if (trans_a) {
   //   CutlassGroupedGemmWithArguments<true, false>(a, b, c, batch_sizes, coord_template, workspace, *arguments);
   //   return;

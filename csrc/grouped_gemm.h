@@ -6,7 +6,7 @@ namespace grouped_gemm {
 
 struct RawGemmArguments;
 
-#define RawGemmArgumentsPtr std::shared_ptr<RawGemmArguments>
+#define RawGemmArgumentsPtr uintptr_t
 
 void GroupedGemm(torch::Tensor a,
 		 torch::Tensor b,
