@@ -456,7 +456,7 @@ torch::Tensor CutlassGroupedGemm(torch::Tensor a,
   auto options = torch::TensorOptions().dtype(torch::kInt8).device(a.device());
   torch::Tensor workspace = torch::empty(workspace_size, options);
 
-  printf("workspace size: %u, ElementA size: %u, ElementB size: %u, ElementC size: %u\n", workspace_size, sizeof(ElementA), sizeof(ElementB), sizeof(ElementC));
+  // printf("workspace size: %u, ElementA size: %u, ElementB size: %u, ElementC size: %u\n", workspace_size, sizeof(ElementA), sizeof(ElementB), sizeof(ElementC));
 
   if (batch_sizes.is_cuda()) {
       FillCutlassArguments<
